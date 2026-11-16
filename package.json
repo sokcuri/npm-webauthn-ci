@@ -1,0 +1,9 @@
+{
+  "name": "npm-webauthn-ci",
+  "private": true,
+  "type": "module",
+  "description": "Headless npm web login with a PEM-backed WebAuthn security key.",
+  "dependencies": {
+    "puppeteer-core": "25.9.0"
+  }
+}
