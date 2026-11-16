@@ -1,15 +1,13 @@
-name: npm login check
+name: npm login check (self-test)
 
-# Tests, from a GitHub-hosted runner (datacenter egress IP), whether a cold
-# headless Chromium can sign in to npm with username/password and pass 2FA with
-# a PEM-backed WebAuthn security key. Never publishes anything.
+# Self-test for this repo. Exercises the composite action (./) in login mode and
+# the Cloudflare probe in probe mode. Other repos should NOT copy this; they call
+# the published action or the reusable workflow instead — see README.
 #
-#   probe  - no secrets, no login: loads npm's public login page a few ways and
-#            reports whether Cloudflare blocks this runner's IP.
-#   login  - full login (password + PEM key), repeated `runs` times on separate
-#            fresh runners to measure flakiness. Test tokens are revoked.
+#   probe  - no secrets, no login: reports whether Cloudflare blocks this runner.
+#   login  - full login via the composite action, on `runs` fresh runners.
 #
-# Repository secrets:   NPM_PASSWORD, NPM_P256_PRIVATE_KEY (contents of private.pem)
+# Repository secrets:   NPM_PASSWORD, NPM_P256_PRIVATE_KEY
 # Repository variables: NPM_USERNAME, NPM_CREDENTIAL_ID
 
 on:
@@ -32,8 +30,6 @@ permissions:
   contents: read
 
 concurrency:
-  # One login at a time: parallel runs could sign in the same second and collide
-  # on npm's signature counter.
   group: npm-login-${{ inputs.mode }}
   cancel-in-progress: false
 
@@ -42,46 +38,6 @@ jobs:
     if: inputs.mode == 'probe'
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      # Pinned to a commit SHA: login jobs hold the npm password and signing key.
-      - name: Install Chrome
-        id: chrome
-        uses: browser-actions/setup-chrome@c785b87e244131f27c9f19c1a33e2ead956ab7ce # v1.7.3
-        with:
-          chrome-version: stable
-      - name: Runner network
-        run: |
-          echo "egress IP: $(curl -s --max-time 10 https://api.ipify.org || echo unknown)"
-          curl -s --max-time 10 "https://ipinfo.io/$(curl -s --max-time 10 https://api.ipify.org)/org" || true
-          echo
-      - run: npm ci
-      - name: Cloudflare probe
-        env:
-          CHROMIUM_PATH: ${{ steps.chrome.outputs.chrome-path }}
-          SPIKE_OUT_DIR: ${{ runner.temp }}/spike-out
-        run: node spike-cloudflare.mjs
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: probe-out
-          path: ${{ runner.temp }}/spike-out/
-          if-no-files-found: warn
-          retention-days: 7
-
-  login:
-    if: inputs.mode == 'login'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      # Serial, not parallel: same-second assertions would be rejected by npm.
-      max-parallel: 1
-      matrix:
-        run: ${{ fromJSON(inputs.runs == '5' && '[1,2,3,4,5]' || inputs.runs == '3' && '[1,2,3]' || inputs.runs == '2' && '[1,2]' || '[1]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -99,49 +55,52 @@ jobs:
           curl -s --max-time 10 "https://ipinfo.io/${IP}/org" || true
           echo
       - run: npm ci
-      - name: Stage signing key
-        id: key
-        env:
-          NPM_P256_PRIVATE_KEY: ${{ secrets.NPM_P256_PRIVATE_KEY }}
-        run: |
-          set -euo pipefail
-          if [ -z "${NPM_P256_PRIVATE_KEY}" ]; then echo "::error::secret NPM_P256_PRIVATE_KEY is not set"; exit 1; fi
-          KEY_DIR="$(mktemp -d)"; chmod 700 "${KEY_DIR}"
-          printf '%s\n' "${NPM_P256_PRIVATE_KEY}" > "${KEY_DIR}/private.pem"
-          chmod 600 "${KEY_DIR}/private.pem"
-          node -e 'const k=require("crypto").createPrivateKey(require("fs").readFileSync(process.argv[1]));if(k.asymmetricKeyType!=="ec"){console.error("::error::not an EC key");process.exit(1)}console.log("signing key parsed:",k.asymmetricKeyType,k.asymmetricKeyDetails.namedCurve)' "${KEY_DIR}/private.pem"
-          echo "dir=${KEY_DIR}" >> "$GITHUB_OUTPUT"
-      - name: npm login (password + PEM security key)
+      - name: Cloudflare probe
         env:
           CHROMIUM_PATH: ${{ steps.chrome.outputs.chrome-path }}
-          NPM_KEY_DIR: ${{ steps.key.outputs.dir }}
-          NPM_USERNAME: ${{ vars.NPM_USERNAME }}
-          NPM_CREDENTIAL_ID: ${{ vars.NPM_CREDENTIAL_ID }}
-          NPM_PASSWORD: ${{ secrets.NPM_PASSWORD }}
-          LOGIN_CHECK_RUN_DIR: ${{ runner.temp }}/login-check-run
-        run: node login-check.mjs
-      - name: Remove signing key
-        if: always()
-        run: rm -rf "${{ steps.key.outputs.dir }}"
-      # run.log already redacts the password and CLI session ids; screenshots
-      # show the masked password field only. Re-check before upload anyway.
-      - name: Check diagnostics for leaks
-        if: always()
-        env:
-          NPM_PASSWORD: ${{ secrets.NPM_PASSWORD }}
-        run: |
-          D="${{ runner.temp }}/login-check-run"
-          [ -d "$D" ] || exit 0
-          if [ -n "${NPM_PASSWORD}" ] && grep -rqaF -- "${NPM_PASSWORD}" "$D"; then
-            echo "::error::password found in diagnostics; deleting instead of uploading"; rm -rf "$D"; exit 1
-          fi
-          if grep -rnaE '(/|%2[Ff])(auth|login)(/|%2[Ff])cli(/|%2[Ff])[A-Za-z0-9-]{8,}' "$D" | grep -qv '<session>'; then
-            echo "::error::unredacted CLI session id found; deleting"; rm -rf "$D"; exit 1
-          fi
+          SPIKE_OUT_DIR: ${{ runner.temp }}/spike-out
+        run: node spike-cloudflare.mjs
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: login-check-run-${{ matrix.run }}
-          path: ${{ runner.temp }}/login-check-run/
-          if-no-files-found: ignore
+          name: probe-out
+          path: ${{ runner.temp }}/spike-out/
+          if-no-files-found: warn
           retention-days: 7
+
+  matrix:
+    if: inputs.mode == 'login'
+    runs-on: ubuntu-latest
+    outputs:
+      runs: ${{ steps.m.outputs.runs }}
+    steps:
+      - id: m
+        env:
+          RUNS: ${{ inputs.runs }}
+        run: echo "runs={\"run\":[$(seq -s, 1 ${RUNS})]}" >> "$GITHUB_OUTPUT"
+
+  login:
+    if: inputs.mode == 'login'
+    needs: matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.matrix.outputs.runs) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Runner network
+        run: |
+          IP="$(curl -s --max-time 10 https://api.ipify.org || echo unknown)"
+          echo "egress IP: ${IP}"
+          curl -s --max-time 10 "https://ipinfo.io/${IP}/org" || true
+          echo
+      - name: npm login check (composite action)
+        uses: ./
+        with:
+          npm-username: ${{ vars.NPM_USERNAME }}
+          npm-credential-id: ${{ vars.NPM_CREDENTIAL_ID }}
+          npm-password: ${{ secrets.NPM_PASSWORD }}
+          npm-private-key: ${{ secrets.NPM_P256_PRIVATE_KEY }}
+          artifact-name: login-check-run-${{ matrix.run }}

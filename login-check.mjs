@@ -20,10 +20,10 @@ import { installShim, loadSigner, shimInstalled } from './webauthn-shim.mjs';
 
 const { NPM_USERNAME, NPM_PASSWORD, NPM_CREDENTIAL_ID, NPM_KEY_DIR } = process.env;
 const missing = Object.entries({ NPM_USERNAME, NPM_PASSWORD, NPM_CREDENTIAL_ID, NPM_KEY_DIR }).filter(([, v]) => !v).map(([k]) => k);
-if (missing.length) { console.error(`missing env: ${missing.join(', ')} (source ~/webauthn-keys/npm.env)`); process.exit(2); }
+if (missing.length) { console.error(`missing env: ${missing.join(', ')}`); process.exit(2); }
 
 const HEADED = process.argv.includes('--headed');
-const ATTEMPTS = 3;
+const ATTEMPTS = Math.max(1, Number(process.env.LOGIN_CHECK_ATTEMPTS) || 3);
 const RUN_DIR = process.env.LOGIN_CHECK_RUN_DIR ?? path.join(os.homedir(), 'webauthn-keys', 'login-check-run');
 fs.rmSync(RUN_DIR, { recursive: true, force: true });
 fs.mkdirSync(RUN_DIR, { recursive: true });

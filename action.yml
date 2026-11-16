@@ -1,0 +1,142 @@
+name: 'npm WebAuthn login check'
+description: >
+  Headless npm web login from a GitHub runner, with 2FA satisfied by a P-256 key
+  held as a PEM file and served to the page through a WebAuthn shim. Never publishes.
+author: 'npm-webauthn-ci'
+
+# Any repo in any org/team can call this:
+#   - uses: sokcuri/npm-webauthn-ci@v1
+#     with:
+#       npm-username:      ${{ vars.NPM_USERNAME }}
+#       npm-credential-id: ${{ vars.NPM_CREDENTIAL_ID }}
+#       npm-password:      ${{ secrets.NPM_PASSWORD }}
+#       npm-private-key:   ${{ secrets.NPM_P256_PRIVATE_KEY }}
+
+inputs:
+  npm-username:
+    description: 'npm account username'
+    required: true
+  npm-credential-id:
+    description: 'base64url credential id registered with npm for the PEM key'
+    required: true
+  npm-password:
+    description: 'npm account password (pass from a secret)'
+    required: true
+  npm-private-key:
+    description: 'Full contents of private.pem for the P-256 credential (pass from a secret)'
+    required: true
+  registry-url:
+    description: 'npm registry the login targets'
+    required: false
+    default: 'https://registry.npmjs.org'
+  node-version:
+    description: 'Node.js version to set up'
+    required: false
+    default: '22'
+  chrome-version:
+    description: 'Chrome channel/version for browser-actions/setup-chrome'
+    required: false
+    default: 'stable'
+  attempts:
+    description: 'Login attempts before giving up (Cloudflare can challenge a cold profile)'
+    required: false
+    default: '3'
+  artifact-name:
+    description: 'Name for the uploaded diagnostics artifact (run.log + screenshots)'
+    required: false
+    default: 'npm-login-check'
+  upload-diagnostics:
+    description: 'Upload run.log and screenshots as an artifact'
+    required: false
+    default: 'true'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+        registry-url: ${{ inputs.registry-url }}
+
+    # Pinned to a commit SHA, not a mutable tag: this step runs in a job that
+    # holds the npm password and the signing key.
+    - name: Install Chrome
+      id: chrome
+      uses: browser-actions/setup-chrome@c785b87e244131f27c9f19c1a33e2ead956ab7ce # v1.7.3
+      with:
+        chrome-version: ${{ inputs.chrome-version }}
+
+    - name: Install login-check dependencies
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: npm ci
+
+    - name: Stage signing key
+      id: key
+      shell: bash
+      env:
+        NPM_P256_PRIVATE_KEY: ${{ inputs.npm-private-key }}
+      run: |
+        set -euo pipefail
+        if [ -z "${NPM_P256_PRIVATE_KEY}" ]; then
+          echo "::error::npm-private-key input is empty"; exit 1
+        fi
+        KEY_DIR="$(mktemp -d)"
+        chmod 700 "${KEY_DIR}"
+        printf '%s\n' "${NPM_P256_PRIVATE_KEY}" > "${KEY_DIR}/private.pem"
+        chmod 600 "${KEY_DIR}/private.pem"
+        node -e '
+          const c = require("node:crypto"), fs = require("node:fs");
+          const k = c.createPrivateKey(fs.readFileSync(process.argv[1], "utf8"));
+          if (k.asymmetricKeyType !== "ec") { console.error(`::error::expected an ec key, got ${k.asymmetricKeyType}`); process.exit(1); }
+          const crv = k.asymmetricKeyDetails?.namedCurve;
+          if (crv !== "prime256v1") { console.error(`::error::expected P-256 (prime256v1), got ${crv}`); process.exit(1); }
+          console.log("signing key parsed: ec P-256");
+        ' "${KEY_DIR}/private.pem"
+        echo "dir=${KEY_DIR}" >> "$GITHUB_OUTPUT"
+
+    - name: npm login (password + PEM security key)
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      env:
+        CHROMIUM_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        NPM_KEY_DIR: ${{ steps.key.outputs.dir }}
+        NPM_USERNAME: ${{ inputs.npm-username }}
+        NPM_CREDENTIAL_ID: ${{ inputs.npm-credential-id }}
+        NPM_PASSWORD: ${{ inputs.npm-password }}
+        LOGIN_CHECK_ATTEMPTS: ${{ inputs.attempts }}
+        LOGIN_CHECK_RUN_DIR: ${{ runner.temp }}/login-check-run
+      run: node login-check.mjs
+
+    - name: Remove signing key
+      if: always()
+      shell: bash
+      run: rm -rf "${{ steps.key.outputs.dir }}"
+
+    # run.log redacts the password and CLI session ids; screenshots show the
+    # masked password field only. Re-scan before upload as a backstop.
+    - name: Check diagnostics for leaks
+      if: always()
+      shell: bash
+      env:
+        NPM_PASSWORD: ${{ inputs.npm-password }}
+      run: |
+        set -euo pipefail
+        D="${{ runner.temp }}/login-check-run"
+        [ -d "$D" ] || exit 0
+        if [ -n "${NPM_PASSWORD}" ] && grep -rqaF -- "${NPM_PASSWORD}" "$D"; then
+          echo "::error::password found in diagnostics; deleting instead of uploading"; rm -rf "$D"; exit 1
+        fi
+        if grep -rnaE '(/|%2[Ff])(auth|login)(/|%2[Ff])cli(/|%2[Ff])[A-Za-z0-9-]{8,}' "$D" | grep -qv '<session>'; then
+          echo "::error::unredacted CLI session id found; deleting"; rm -rf "$D"; exit 1
+        fi
+
+    - name: Upload diagnostics
+      if: always() && inputs.upload-diagnostics == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ runner.temp }}/login-check-run/
+        if-no-files-found: ignore
+        retention-days: 7

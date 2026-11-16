@@ -1,0 +1,99 @@
+name: Reusable npm login check
+
+# Whole-job reuse for any repo/org:
+#
+#   jobs:
+#     login:
+#       uses: sokcuri/npm-webauthn-ci/.github/workflows/reusable-login.yml@v1
+#       with:
+#         npm-username:      ${{ vars.NPM_USERNAME }}
+#         npm-credential-id: ${{ vars.NPM_CREDENTIAL_ID }}
+#       secrets:
+#         npm-password:    ${{ secrets.NPM_PASSWORD }}
+#         npm-private-key: ${{ secrets.NPM_P256_PRIVATE_KEY }}
+#
+# Prefer this when you want a ready-made job. For step-level control inside your
+# own job, use the composite action directly: uses: sokcuri/npm-webauthn-ci@v1
+
+on:
+  workflow_call:
+    inputs:
+      npm-username:
+        description: 'npm account username'
+        required: true
+        type: string
+      npm-credential-id:
+        description: 'base64url credential id registered with npm'
+        required: true
+        type: string
+      runs:
+        description: 'Number of independent runners to try, in sequence (1-5)'
+        required: false
+        default: 1
+        type: number
+      runner:
+        description: 'runs-on label'
+        required: false
+        default: 'ubuntu-latest'
+        type: string
+      node-version:
+        required: false
+        default: '22'
+        type: string
+      chrome-version:
+        required: false
+        default: 'stable'
+        type: string
+    secrets:
+      npm-password:
+        required: true
+      npm-private-key:
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  # One login at a time per caller: parallel logins could sign the same second
+  # and collide on npm's server-side signature counter.
+  group: npm-webauthn-login-${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        shell: bash
+        env:
+          RUNS: ${{ inputs.runs }}
+        run: |
+          set -euo pipefail
+          n="${RUNS}"
+          case "$n" in ''|*[!0-9]*) n=1;; esac
+          [ "$n" -lt 1 ] && n=1
+          [ "$n" -gt 5 ] && n=5
+          arr="$(seq -s, 1 "$n")"
+          echo "matrix={\"run\":[${arr}]}" >> "$GITHUB_OUTPUT"
+
+  login:
+    needs: setup
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    steps:
+      - name: npm login check
+        uses: sokcuri/npm-webauthn-ci@v1
+        with:
+          npm-username: ${{ inputs.npm-username }}
+          npm-credential-id: ${{ inputs.npm-credential-id }}
+          npm-password: ${{ secrets.npm-password }}
+          npm-private-key: ${{ secrets.npm-private-key }}
+          node-version: ${{ inputs.node-version }}
+          chrome-version: ${{ inputs.chrome-version }}
+          artifact-name: npm-login-check-${{ matrix.run }}
